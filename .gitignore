@@ -1,0 +1,16 @@
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Test binaries
+*.test
+
+# IDE / OS temporary files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
