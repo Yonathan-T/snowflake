@@ -14,7 +14,13 @@ Snowflake solves this by generating 64-bit, time-ordered (k-sorted) integers in 
 
 - **64-bit Binary Packing:** We pack four separate fields into an 8-byte signed integer (`int64`):
   - **Bit 63 (Sign Bit):** Always `0` so the number is strictly positive across databases (PostgreSQL/MySQL `BIGINT`), Protobuf, and JSON without signed/unsigned conversion bugs.
-  - **Bits 62 to 22 (41 bits Timestamp):** Milliseconds elapsed since our custom project epoch (October 4, 2026). This gives the generator a clean **~69.7-year lifespan** before overflowing.
+  - **Bits 62 to 22 (41 bits Timestamp):** Milliseconds elapsed since our custom project epoch (October 4, 2026). With 41 bits, the maximum number of milliseconds is:
+    ```text
+            (2^41 - 1) ms                 2,199,023,255,551 ms
+    -----------------------------  =  ----------------------------  ≈ 69.7 years
+     1000 * 60 * 60 * 24 * 365.25        31,557,600,000 ms/year
+    ```
+    Starting from October 4, 2026, this gives the cluster collision-free runway until the year **2096** before the timestamp rolls over.
   - **Bits 21 to 12 (10 bits Worker ID):** Supports up to **1,024 independent machines/containers** generating IDs simultaneously.
   - **Bits 11 to 0 (12 bits Sequence):** Rolls from `0` to `4,095` to allow up to **4,096 IDs per millisecond per worker** (>4 million IDs/sec per node).
 - **Bitwise Math & Masking:** Instead of slow arithmetic, bitmasks and offsets are derived using two's complement bitwise XOR shifts (`maxWorkerID = -1 ^ (-1 << 10)` gives `1023`), and packed with left-shifts and bitwise OR: `((now - epoch) << 22) | (workerID << 12) | sequence`.
@@ -27,7 +33,7 @@ Snowflake solves this by generating 64-bit, time-ordered (k-sorted) integers in 
 ## Requirements
 
 - Go 1.22+
-- Docker (for etcd)
+- Docker & Docker Compose
 - `protoc` (optional, for regenerating protobuf stubs)
 
 
@@ -36,22 +42,26 @@ Snowflake solves this by generating 64-bit, time-ordered (k-sorted) integers in 
 
 ### 1. Start the etcd Coordinator
 
-Start a local etcd container to handle dynamic worker ID discovery:
+Launch etcd in one command:
 
 ```bash
-docker run -d --name etcd-snowflake -p 2379:2379 quay.io/coreos/etcd:v3.5.9 \
-  /usr/local/bin/etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://0.0.0.0:2379
+make up
+# or: docker compose up -d
 ```
+
+This starts:
+- **etcd** (`:2379`) — Distributed worker ID leasing and health checks via atomic Compare-And-Swap leases.
 
 ### 2. Start the Snowflake gRPC Server
 
-Run the server:
+Run the server on port `:50051`:
 
 ```bash
-go run cmd/server/main.go --port=50051
+make server
+# or: go run cmd/server/main.go --port=50051
 ```
 
-On boot, the server registers with etcd, claims an available worker badge (e.g. Worker `0`), starts the keepalive heartbeat, and listens for gRPC requests on `:50051`.
+On boot, the server registers with etcd, claims an available worker badge (e.g. Worker `0`), starts the keepalive heartbeat, and begins serving.
 
 *(If you spin up another server in a second terminal on `--port=50052`, it will detect Worker 0 is occupied and automatically claim Worker `1`!)*
 
@@ -59,12 +69,13 @@ On boot, the server registers with etcd, claims an available worker badge (e.g. 
 
 ## Usage
 
-You can query the server using the included Go test client or any gRPC client in Python, Node.js, etc.
+### 1. Verification Client
 
-Run the test client:
+Query the server over gRPC to test server status, ID generation, and ID parsing:
 
 ```bash
-go run cmd/client/main.go
+make client
+# or: go run cmd/client/main.go
 ```
 
 Output:
@@ -74,9 +85,26 @@ Output:
 2026/10/07 02:54:33 Parsed ID -> Time: 2026-10-06T23:54:33Z, WorkerID: 0, Sequence: 0
 ```
 
-### Inspecting Cluster State in etcd
+### 2. High-Concurrency Stress Testing
 
-To see which machines currently hold which worker badges:
+Hammer the server with concurrent worker goroutines and assert zero collisions across all generated IDs:
+
+```bash
+make stress
+# or: go run cmd/stress/main.go --workers=100 --requests=1000
+```
+
+Output:
+```text
+Starting stress test against localhost:50051: 100 concurrent goroutines, 1000 requests each (100000 total IDs)...
+Stress test completed in 1.48s
+Total IDs generated: 100000 / 100000
+Throughput: 67567 IDs/sec over gRPC network
+```
+
+### 3. Inspecting Cluster State in etcd
+
+To see which physical machines currently hold which worker badges:
 
 ```bash
 docker exec etcd-snowflake etcdctl get /snowflake/workers/ --prefix
@@ -94,13 +122,13 @@ YonathanT:50052
 
 ## Tests & Benchmarks
 
-Run the test suite (verifies monotonicity and race-free uniqueness across 100,000 IDs on 50 concurrent goroutines):
+Run the unit and race detector test suite:
 
 ```bash
 go test -v ./pkg/snowflake
 ```
 
-Run throughput benchmarks:
+Run in-memory generation benchmarks:
 
 ```bash
 go test -bench=BenchmarkNextID -benchmem .\pkg\snowflake
@@ -108,6 +136,8 @@ go test -bench=BenchmarkNextID -benchmem .\pkg\snowflake
 
 Output:
 ```text
+.
+.
 BenchmarkNextID-16    4583570    265.1 ns/op    0 B/op    0 allocs/op
 ```
 
