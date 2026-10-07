@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"time"
 
+	coordinator "snowflake/pkg/coordinator"
 	"snowflake/pkg/snowflake"
 	snowflakepb "snowflake/proto"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"google.golang.org/grpc"
 )
@@ -49,12 +53,36 @@ func (s *server) GetServerStatus(ctx context.Context, req *snowflakepb.GetServer
 	}, nil
 }
 
-func main() {
-	port := flag.Int("port", 50051, "gRPC server port")
-	workerID := flag.Int64("worker", 1, "worker ID")
-	flag.Parse()
+func etcdClient(port int) (int, *clientv3.Client, error) {
+	client, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{"localhost:2379"},
+		DialTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("Failed to connect to etcd: %v", err)
+	}
 
-	node, err := snowflake.NewSnowflake(*workerID)
+	hostname, _ := os.Hostname()
+	identity := fmt.Sprintf("%s:%d", hostname, port)
+	workerID, leaseID, err := coordinator.AllocateWorker(client, identity, 10)
+	if err != nil {
+		log.Fatalf("Failed to allocate worker: %v", err)
+	}
+	fmt.Printf("Successfully claimed Worker ID: %d with Lease: %x\n", workerID, *leaseID)
+	return workerID, client, err
+}
+
+func main() {
+
+	port := flag.Int("port", 50051, "gRPC server port")
+	flag.Parse()
+	workerID, client, err := etcdClient(*port)
+	if err != nil {
+		log.Fatalf("Failed to allocate worker: %v", err)
+	}
+	defer client.Close()
+
+	node, err := snowflake.NewSnowflake(int64(workerID))
 	if err != nil {
 		log.Fatalf("failed to create a snowflake node: %v", err)
 	}
@@ -66,7 +94,7 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 	snowflakepb.RegisterSnowflakeServiceServer(grpcServer, &server{node: node})
-	log.Printf("Snowflake gRPC server listening on port %d (Worker ID: %d)", *port, *workerID)
+	log.Printf("Snowflake gRPC server listening on port %d (Worker ID: %d)", *port, workerID)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
